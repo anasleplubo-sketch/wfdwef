@@ -1,71 +1,101 @@
 name: Build MINOS SIGINT APK
- 
+
 on:
   push:
     branches: [ main ]
   workflow_dispatch:
- 
+
 jobs:
   build-apk:
     runs-on: ubuntu-22.04
- 
+
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
- 
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
- 
-      - name: Set up Java 17
-        uses: actions/setup-java@v4
+
+      - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
- 
+
+      # ── Deps système pour compiler OpenCV + p4a ───────────────────────────
       - name: Install system dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-            git zip unzip \
-            build-essential ccache \
-            autoconf automake libtool \
-            pkg-config cmake \
-            zlib1g-dev libffi-dev libssl-dev \
-            libltdl-dev libncurses5-dev \
-            libbz2-dev lzma liblzma-dev \
+            git zip unzip build-essential ccache \
+            autoconf automake libtool pkg-config cmake \
+            zlib1g-dev libffi-dev libssl-dev libltdl-dev \
+            libncurses5-dev libbz2-dev lzma liblzma-dev \
             python3-dev libsqlite3-dev
- 
+
+      # ── Buildozer ─────────────────────────────────────────────────────────
       - name: Install Buildozer and Cython
         run: |
           pip install --upgrade pip setuptools wheel
           pip install cython==3.0.11
           pip install buildozer==1.5.0
- 
-      - name: Cache Buildozer global directory
+
+      # ── Android SDK : licences + composants + symlink de compatibilité ────
+      # Buildozer 1.5.0 cherche sdkmanager à l'ancien chemin tools/bin/.
+      # Le SDK moderne le met dans cmdline-tools/latest/bin/.
+      # → on accepte les licences, on installe les composants requis,
+      #   et on crée le symlink que buildozer attend.
+      - name: Setup Android SDK
+        run: |
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses
+
+          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager \
+            "platform-tools" \
+            "platforms;android-33" \
+            "build-tools;34.0.0"
+
+          mkdir -p $ANDROID_HOME/tools/bin
+          ln -sf $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager \
+                 $ANDROID_HOME/tools/bin/sdkmanager
+          ln -sf $ANDROID_HOME/cmdline-tools/latest/bin/avdmanager \
+                 $ANDROID_HOME/tools/bin/avdmanager
+
+      # ── Injecter android.sdk_path dans buildozer.spec ────────────────────
+      # Évite que buildozer re-télécharge un SDK depuis zéro.
+      - name: Inject SDK path into buildozer.spec
+        run: |
+          python3 - << 'PY'
+          import os, re
+          sdk = os.environ['ANDROID_HOME']
+          with open('buildozer.spec') as f:
+              content = f.read()
+          # Insère avant la section [buildozer]
+          content = re.sub(
+              r'(\[buildozer\])',
+              f'android.sdk_path = {sdk}\n\n\\1',
+              content
+          )
+          with open('buildozer.spec', 'w') as f:
+              f.write(content)
+          print('android.sdk_path =', sdk)
+          PY
+
+      # ── Cache : seulement p4a + NDK (pas le SDK, géré par le runner) ──────
+      # Clé v3 pour invalider le cache cassé des runs précédentes.
+      - name: Cache p4a and NDK
         uses: actions/cache@v4
         with:
-          path: ~/.buildozer
-          key: ${{ runner.os }}-buildozer-${{ hashFiles('buildozer.spec') }}-v1
+          path: |
+            ~/.buildozer/android/platform/android-ndk-r25b
+            ~/.buildozer/android/platform/python-for-android
+          key: ${{ runner.os }}-p4a-ndk25b-v3-${{ hashFiles('buildozer.spec') }}
           restore-keys: |
-            ${{ runner.os }}-buildozer-
- 
-      # ── FIX: pre-accept Android SDK licenses ──────────────────────────────
-      # sdkmanager asks "Accept? (y/N)" interactively — in CI nothing answers
-      # so it skips build-tools and the build breaks.
-      # Two-layer fix:
-      #   1. Copy already-accepted licenses from the GitHub runner's own SDK
-      #   2. yes | pipes "y" to any remaining interactive prompts
+            ${{ runner.os }}-p4a-ndk25b-v3-
+
+      # ── Build ─────────────────────────────────────────────────────────────
       - name: Build debug APK
-        run: |
-          mkdir -p ~/.buildozer/android/platform/android-sdk/licenses
-          if [ -d "$ANDROID_HOME/licenses" ]; then
-            cp -f "$ANDROID_HOME/licenses/"* \
-              ~/.buildozer/android/platform/android-sdk/licenses/ 2>/dev/null || true
-          fi
-          yes | buildozer android debug 2>&1 | tee build.log
- 
+        run: yes | buildozer android debug 2>&1 | tee build.log
+
+      # ── Artifacts ─────────────────────────────────────────────────────────
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
@@ -73,7 +103,7 @@ jobs:
           path: bin/*.apk
           if-no-files-found: error
           retention-days: 30
- 
+
       - name: Upload build log
         if: always()
         uses: actions/upload-artifact@v4
@@ -81,4 +111,3 @@ jobs:
           name: build-log-${{ github.sha }}
           path: build.log
           if-no-files-found: ignore
- 
